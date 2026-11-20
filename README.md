@@ -4,7 +4,7 @@
 
 โมเดลและฐานข้อมูลทั้งหมดรันบนเครื่องเรา ส่วนที่ต่อออกข้างนอกมีแค่ Google Drive เนื้อหาเอกสารจึงไม่ถูกส่งไปที่บริการ AI ภายนอก
 
-> **สถานะ:** ตอนนี้ repo มี pipeline ต้นแบบที่ทดสอบกับบทความ Wikipedia (โฟลเดอร์ `scripts/`) ส่วน Search Service (FastAPI) ที่ต่อกับ n8n ยังอยู่ระหว่างทำ ดู [แผนงาน](#แผนงาน)
+> **สถานะ:** Search Service (FastAPI, โฟลเดอร์ `service/`) รับ PDF และค้นหาได้แล้ว ทดสอบกับ mock data ในเครื่อง ยังไม่ได้ต่อกับ n8n จริง ดู [แผนงาน](#แผนงาน)
 
 ## ภาพรวมระบบ
 
@@ -31,7 +31,13 @@ Search Service ไม่ต้องมี credential ของ Google Drive แ
 ## โครงสร้าง repo
 
 ```
+service/                 Search Service (API ที่ n8n เรียก)
+  api.py                 endpoint ทั้งหมด, ตรวจ API key, รูปแบบ error
+  indexer.py             index / ลบ / ค้นหา (ChromaDB + SQLite) รวมผลเป็นรายการเอกสาร
+  pdf_text.py            อ่านข้อความจาก PDF รายหน้า
+  config.py              อ่านค่าตั้งค่าจาก .env
 scripts/
+  upload_folder.py       ส่ง PDF ในโฟลเดอร์ในเครื่องเข้า service (ทดสอบแทน n8n)
   common.py              เลือก CPU/GPU ใช้ร่วมกันทุกสคริปต์
   fetch_wikipedia.py     ดึงบทความ Wikipedia มาเป็นข้อมูลทดสอบ → data/raw/wikipedia.jsonl
   chunk.py               หั่นบทความเป็นท่อน (500 ตัวอักษร, overlap 100) → data/chunks/chunks.jsonl
@@ -39,19 +45,61 @@ scripts/
   search.py              ค้นหาจาก command line
   evaluate_retrieval.py  วัดผลการค้นหา (Hit@k, MRR) ด้วยชุดคำถามที่มีเฉลย
 requirements.txt
+.env.example             ตัวอย่างค่าตั้งค่า (คัดลอกเป็น .env)
 ```
 
-ไฟล์ข้อมูล (`data/`), โมเดล (`pretrained_models/`) และชุดคำถาม (`eval/`) ไม่ถูก commit ขึ้น git
+ไฟล์ข้อมูล (`data/`), โมเดล (`pretrained_models/`), ชุดคำถาม (`eval/`) และ `.env` ไม่ถูก commit ขึ้น git
 
-## เริ่มต้นใช้งาน (pipeline ต้นแบบ)
+## ติดตั้ง
 
-ต้องมี Python 3.10 ขึ้นไป ถ้ามี GPU ให้ติดตั้ง PyTorch แบบ CUDA ก่อน ไม่งั้นจะรันบน CPU (ช้ากว่าแต่ใช้ได้)
+ต้องมี Python 3.10 ขึ้นไป
 
-```bash
+```powershell
 python -m venv .venv
-.venv\Scripts\activate          # Windows  (macOS/Linux: source .venv/bin/activate)
+.venv\Scripts\Activate.ps1      # macOS/Linux: source .venv/bin/activate
+
+# มี GPU (NVIDIA): ติดตั้ง PyTorch แบบ CUDA ก่อน ไม่งั้นจะได้แบบ CPU (ช้ากว่าแต่ใช้ได้)
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+
 pip install -r requirements.txt
+
+# ดาวน์โหลดโมเดลมาไว้ในโปรเจกต์ (~2.3 GB)
+hf download BAAI/bge-m3 --local-dir pretrained_models/bge-m3
 ```
+
+## รัน Search Service
+
+```powershell
+Copy-Item .env.example .env      # แล้วแก้ API_KEY ใน .env
+uvicorn service.api:app --host 0.0.0.0 --port 8000
+```
+
+เปิด `http://localhost:8000/docs` เพื่อลองเรียกผ่าน Swagger ในแต่ละ endpoint ให้ใส่ค่า `API_KEY` ในช่อง `x-api-key`
+
+ทดสอบด้วย PDF ในเครื่องแทน n8n: วาง PDF ไว้ในโครง `data/mock/ลูกค้า/<ชื่อลูกค้า>/<ชื่องาน>/` แล้วรัน (เปิด service ค้างไว้อีกหน้าต่าง)
+
+```powershell
+python scripts/upload_folder.py data/mock
+```
+
+`folder_path` จะได้จากโครงโฟลเดอร์ เช่น `/ลูกค้า/ลูกค้า A/งาน A` ส่งไฟล์เดิมซ้ำจะได้ `unchanged`
+
+ค่าตั้งค่าทั้งหมดอยู่ใน `.env.example` ที่ใช้บ่อย:
+
+| ค่า | ค่าเริ่มต้น | ความหมาย |
+| --- | --- | --- |
+| `API_KEY` | (ต้องตั้ง) | รหัสที่ n8n ส่งมาใน header `X-API-Key` |
+| `EMBEDDING_MODEL` | `pretrained_models/bge-m3` | path ในโปรเจกต์ หรือชื่อบน Hugging Face |
+| `DEVICE` | `auto` | `cpu`, `cuda` |
+| `EMBED_BATCH_SIZE` | `8` | ลดลงถ้าเจอ CUDA out of memory |
+| `SEARCH_MIN_SCORE` | `0.45` | ตัดผลที่คะแนนต่ำกว่านี้ (ปรับหลังวัดผลกับเอกสารจริง) |
+| `HF_HUB_OFFLINE` | `1` | ห้ามต่อ Hugging Face ใช้โมเดลในเครื่องเท่านั้น |
+
+index ถูกเก็บที่ `data/service_index/` ถ้าเปลี่ยนโมเดล service จะไม่ยอมเปิด ให้ลบโฟลเดอร์นี้หรือเปลี่ยน `COLLECTION` แล้ว index ใหม่
+
+## pipeline ต้นแบบ (Wikipedia)
+
+ใช้ทดลองเทียบโมเดลและวัดผล แยกจาก Search Service
 
 รันตามลำดับ:
 
@@ -114,14 +162,14 @@ Field ที่บังคับใน `POST /documents`: `file`, `file_id`, `n
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/documents \
-  -H "X-API-Key: dev-key" \
+  -H "X-API-Key: <API_KEY>" \
   -F "file=@mom.pdf" -F "file_id=1AbCxyz" -F "name=MoM ลูกค้า A.pdf" \
   -F "mime_type=application/pdf" -F "folder_path=/ลูกค้า/ลูกค้า A/งาน A" \
   -F "modified_time=2026-11-18T09:15:22.000Z" \
   -F "web_view_link=https://drive.google.com/file/d/1AbCxyz/view"
 
 curl -X POST http://localhost:8000/api/v1/search \
-  -H "X-API-Key: dev-key" -H "Content-Type: application/json" \
+  -H "X-API-Key: <API_KEY>" -H "Content-Type: application/json" \
   -d '{"query": "เอกสารที่คุยกับลูกค้า A เรื่องงาน A"}'
 ```
 
@@ -133,14 +181,6 @@ n8n อยู่คนละเครื่องกับ service จึงต�
 2. เปิด port 8000 ใน Windows Firewall
 3. ถ้าอยู่คนละเครือข่าย ใช้ [Tailscale](https://tailscale.com/) ทั้งสองเครื่อง แทนการเปิด port ออก internet
 4. ให้เพื่อนเปิด `http://<IP>:8000/api/v1/health` จากเครื่องเขา ต้องได้ `{"status":"ok"}`
-
-ตั้งค่าผ่านไฟล์ `.env` (ไม่ commit):
-
-```
-API_KEY=change-me
-EMBEDDING_MODEL=BAAI/bge-m3
-DEVICE=auto
-```
 
 ## ข้อตกลงระยะแรก
 
@@ -156,11 +196,13 @@ DEVICE=auto
 ## แผนงาน
 
 - [x] pipeline ต้นแบบ: chunk → embed → ChromaDB → search → evaluate
-- [ ] แยกข้อความจาก PDF รายหน้า (เช่น PyMuPDF) แทนข้อมูล Wikipedia
-- [ ] เก็บ metadata ต่อท่อน: `file_id`, `file_name`, `folder_path`, `page`, `link`, `modified_time`
-- [ ] index ทีละไฟล์แบบ upsert (ตอนนี้ `build_index.py` ลบ collection แล้วสร้างใหม่ทุกครั้ง)
-- [ ] `search` คืนเป็นรายการเอกสาร (รวมผลตาม `file_id`) แทนรายการท่อน
-- [ ] `api.py` (FastAPI) ห่อ endpoint ทั้งหมด โหลดโมเดลครั้งเดียวตอนเริ่ม
+- [x] แยกข้อความจาก PDF รายหน้า (PyMuPDF) แก้สระอำที่ PDF เก็บผิด
+- [x] เก็บ metadata: ต่อท่อน `file_id`, `page` / ต่อไฟล์ใน SQLite `name`, `folder_path`, `modified_time`, `web_view_link`
+- [x] index ทีละไฟล์แบบ upsert ข้ามไฟล์ที่ `modified_time` เท่าเดิม
+- [x] ค้นหาคืนเป็นรายการเอกสาร (รวมผลตาม `file_id`) กรองตาม `folder_prefix`, `modified_after` ได้
+- [x] FastAPI ครบ 5 endpoint ตาม contract โหลดโมเดลครั้งเดียวตอนเริ่ม
+- [ ] ต่อกับ n8n ของเพื่อนข้ามเครื่อง
+- [ ] เปลี่ยน mock เป็นข้อมูลจากอีกทีม แล้วปรับการแยกชื่อลูกค้า / งาน
 - [ ] hybrid search: BM25 ตัดคำด้วย PyThaiNLP ร่วมกับ vector เพื่อให้ค้นชื่อลูกค้าหรือรหัสงานเจอ
 - [ ] ชุดคำถาม eval จากเอกสารจริง วัดผลระดับไฟล์
 - [ ] `POST /ask` (RAG) ด้วย LLM local
